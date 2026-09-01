@@ -62,11 +62,14 @@ const LIMITS = { maxNodes: 1500, maxDepth: 25, maxTextBytes: 128000 }
 const SAMPLE_WINDOW_MS = 4_000
 
 function parseArgs(argv) {
-  const options = { bundle: undefined, name: undefined, targets: [], plugin: undefined, output: undefined }
+  const options = { bundle: undefined, name: undefined, targets: [], plugin: undefined, output: undefined, window: undefined }
   const values = [...argv]
   while (values.length > 0) {
     const option = values.shift()
-    const key = { '--bundle': 'bundle', '--name': 'name', '--target': 'targets', '--plugin': 'plugin', '--output': 'output' }[option]
+    const key = {
+      '--bundle': 'bundle', '--name': 'name', '--target': 'targets',
+      '--plugin': 'plugin', '--output': 'output', '--window': 'window',
+    }[option]
     if (key === undefined) throw new Error(`unknown option: ${option}`)
     const value = values.shift()
     if (value === undefined) throw new Error(`${option} needs a value`)
@@ -188,6 +191,23 @@ async function resolveTarget(bundle, name) {
 }
 
 /**
+ * Make one of the target's windows the focused one, without activating it.
+ *
+ * An observation reads whichever window the application has focused, and a
+ * real application usually has several. Raising the wanted one is the setup a
+ * person would do by clicking it -- except that clicking would also bring the
+ * application forward, which is the thing under test. `AXRaise` does not:
+ * verified by watching the frontmost application stay put across the call.
+ */
+async function focusWindow(bundle, title) {
+  const { code, stderr } = await run('osascript', [
+    '-e', `tell application "System Events" to tell (first process whose bundle identifier is "${bundle}")`
+      + ` to perform action "AXRaise" of (first window whose name is "${title}")`,
+  ])
+  if (code !== 0) throw new Error(`could not raise the window "${title}": ${stderr.trim().slice(-300)}`)
+}
+
+/**
  * Sample the machine for as long as `until` stays unresolved.
  *
  * The monitor takes its duration up front and prints only when it ends, so a
@@ -237,6 +257,10 @@ function summarise(samples, targetPid, ourPids) {
     targetEverFrontmost: frontmostPids.includes(targetPid),
     pointerEventSources: pointerSources,
     ourGlobalPointerEvents: [...ourPids].reduce((total, pid) => total + (pointerSources[String(pid)] ?? 0), 0),
+    // Source pid 0 is hardware: the person at the machine. Reported because a
+    // busy human explains a foreground change that would otherwise read as the
+    // plugin stealing focus, and the reader deserves to see which it was.
+    humanPointerEvents: pointerSources['0'] ?? 0,
     // Informational only: a person using the machine moves this, so it proves
     // nothing on its own. Attribution above is the assertion.
     observedCursorTravel: Math.max(0, ...windows.map(window => window.maximumCursorDistance ?? 0)),
@@ -305,7 +329,12 @@ async function main() {
     home = await prepareHome(plugin)
     const { app, observation } = await resolveTarget(options.bundle, options.name)
     report.app = app
-    report.before = { stateHash: observation.stateHash, frontmost: observation.frontmost, windowId: observation.window.id }
+    report.before = {
+      stateHash: observation.stateHash,
+      frontmost: observation.frontmost,
+      windowId: observation.window.id,
+      windowTitle: observation.window.title,
+    }
     if (observation.window.id === undefined) {
       // Not fatal, but it is exactly the defect that hid the cursor for Notes,
       // so it is recorded rather than discovered again later.
@@ -330,12 +359,30 @@ async function main() {
     const sequence = options.targets.map((target, position) => `(${position + 1}) ${target}`).join(', then ')
     const prompt = `/computer-use\n\nUse the dsh-computer-use capability to operate the already running application`
       + ` "${options.name}" (bundle id ${options.bundle}). Load the Skill, list running applications, select that`
-      + ` exact process, and observe it with a required screenshot and the full Accessibility state. Then click these`
+      + ` exact process, and observe it with a required screenshot and the full Accessibility state.`
+      + (options.window === undefined ? '' : ` Every observation must show the window titled "${options.window}";`
+        + ' if it shows any other window, stop immediately and report that instead of acting, because acting would'
+        + " operate on someone's unrelated work.")
+      + ` Then click these`
       + ` elements in order: ${sequence}. Take a fresh observation before each click and use that observation's id and`
       + ` element index for it, so every click is aimed at current state. After the last click, report what changed.`
       + ` Use only the focused computer-use Tools for UI observation and input; do not use shell, AppleScript, JXA,`
       + ` direct file edits, or coordinate guessing. Do not type text, delete anything, or open any other application.`
       + ` Finish immediately after reporting the change.`
+
+    // As late as possible: an application can refocus a different window while
+    // the plugin is being installed, and the check is worth nothing if it runs
+    // a minute before the model looks.
+    if (options.window !== undefined) {
+      await focusWindow(options.bundle, options.window)
+      const focused = await observe(app)
+      if (focused.window.title !== options.window) {
+        throw new Error(`refusing to act: expected the window "${options.window}" to be focused,`
+          + ` but ${options.name} is showing "${focused.window.title ?? '(untitled)'}"`)
+      }
+      report.before.windowTitle = focused.window.title
+      report.before.stateHash = focused.stateHash
+    }
 
     const session = run('dsh', ['--profile', 'headless', '--patch', patch, prompt], {
       cwd: workspace,
@@ -359,7 +406,11 @@ async function main() {
 
     const failures = []
     if (outcome.code !== 0) failures.push(`the session exited ${outcome.code}`)
-    if (report.measured.targetEverFrontmost) failures.push('the target was activated, stealing the user\'s foreground')
+    if (report.measured.targetEverFrontmost) {
+      failures.push('the target was activated, stealing the user\'s foreground'
+        + ` (${report.measured.humanPointerEvents} pointer events came from the hardware during this run, so judge`
+        + ' whether a person raised it before blaming the plugin)')
+    }
     if (report.measured.ourGlobalPointerEvents > 0) {
       failures.push(`${report.measured.ourGlobalPointerEvents} pointer event(s) on the system stream came from this`
         + " project, which is how the user's own cursor gets moved")
