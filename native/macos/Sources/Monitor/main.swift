@@ -54,6 +54,14 @@ private var maximumCursorDistance = 0.0
 private var observedFrontmostPids = Set<Int32>()
 private var maximumMatchingWindowCount = 0
 private var matchingWindowFrames: [[String: Any]] = []
+/// Every distinct place the matched window has been, in the order it went
+/// there. `matchingWindowFrames` keeps only the most recent sample, so a panel
+/// that moved through several positions during the run is indistinguishable
+/// from one that never moved at all -- which is the exact defect a caller
+/// watching the Agent cursor is trying to detect.
+private var observedWindowOrigins: [[String: Double]] = []
+/// Enough to show a movement track without turning a long run into a log file.
+private let originTrackLimit = 512
 private var monitoredSourcePointerEvents = 0
 private var pointerEventSourceCounts: [String: Int] = [:]
 private var samples = 0
@@ -111,6 +119,16 @@ while DispatchTime.now().uptimeNanoseconds < deadline {
     if let first = windows.first,
        let bounds = first[kCGWindowBounds as String] as? [String: Any] {
         matchingWindowFrames = [bounds]
+        if let x = (bounds["X"] as? NSNumber)?.doubleValue,
+           let y = (bounds["Y"] as? NSNumber)?.doubleValue,
+           observedWindowOrigins.count < originTrackLimit {
+            // Consecutive duplicates are the common case at this sample rate;
+            // recording only changes keeps the track a record of movement.
+            let last = observedWindowOrigins.last
+            if last?["x"] != x || last?["y"] != y {
+                observedWindowOrigins.append(["x": x, "y": y])
+            }
+        }
     }
     samples += 1
     if eventTapSource != nil {
@@ -130,6 +148,7 @@ let result: [String: Any] = [
     "samples": samples,
     "maximumMatchingWindowCount": maximumMatchingWindowCount,
     "matchingWindowFrames": matchingWindowFrames,
+    "observedWindowOrigins": observedWindowOrigins,
     "eventTapAvailable": eventTap != nil,
     "monitoredSourcePointerEvents": monitoredSourcePointerEvents,
     "pointerEventSourceCounts": pointerEventSourceCounts,
